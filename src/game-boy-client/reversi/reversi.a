@@ -1,0 +1,1425 @@
+INCLUDE "gb-hardware.inc"
+
+;--------------------------------
+
+COLOR_NONE  EQU 0
+COLOR_BLACK EQU 1
+COLOR_WHITE EQU 2
+
+GAME_STATE_STARTING             EQU $00
+GAME_STATE_JOINING              EQU $01
+GAME_STATE_WAITING_FOR_PLAYER_2 EQU $02
+GAME_STATE_PLAYER_TURN          EQU $03
+GAME_STATE_DRAW_GAME_INFO       EQU $04
+GAME_STATE_OTHER_PLAYER_TURN    EQU $05
+GAME_STATE_TRYING_PLACE_DISC    EQU $06
+GAME_STATE_MOVE_IS_VALID        EQU $07
+GAME_STATE_MOVE_IS_NOT_VALID    EQU $08
+GAME_STATE_OTHER_PLAYER_IS_DONE EQU $09
+GAME_STATE_GETTING_OTHER_DISCS  EQU $0A
+GAME_STATE_FLIPPING_DISCS       EQU $0B
+
+BUTTON_STILL_PRESSED  EQU %00000000
+BUTTON_JUST_RELEASED  EQU %00000001
+BUTTON_JUST_PRESSED   EQU %00000010
+BUTTON_STILL_RELEASED EQU %00000011
+
+NO_DATA                       EQU $00
+GAME_BOY_STATUS_REQUESTED     EQU $01
+GAME_BOY_JOINING              EQU $02
+GAME_BOY_WAITING_FOR_PLAYER_2 EQU $03
+PLAYER_2_JOINED               EQU $04
+PLAYER_2_NOT_JOINED           EQU $05
+COLOR_SET_BLACK               EQU $06
+COLOR_SET_WHITE               EQU $07
+; $08 - $48 represent disc indexes.
+MOVE_IS_VALID                 EQU $49
+MOVE_IS_NOT_VALID             EQU $4A
+GET_NEXT_DISC_TO_FLIP         EQU $4B
+GET_OTHER_PLAYER_MOVE         EQU $4C
+NO_MORE_DISCS_TO_FLIP         EQU $4D
+WAITING_FOR_OTHER_PLAYER_TURN EQU $4E
+OTHER_PLAYER_IS_DONE          EQU $4F
+OTHER_PLAYER_IS_NOT_DONE      EQU $50
+
+;--------------------------------
+
+SECTION "ram", WRAM0
+
+gameState:             DS 1
+discs:                 DS 64
+discsToFlipCoords:     DS 36
+discsToFlipCoordIndex: DS 1
+animationFrame:        DS 1
+animationCountdown:    DS 1
+
+isRightPressed:  DS 1
+isLeftPressed:   DS 1
+isUpPressed:     DS 1
+isDownPressed:   DS 1
+
+isAPressed:      DS 1
+isBPressed:      DS 1
+isSelectPressed: DS 1
+isStartPressed:  DS 1
+
+handX: DS 1
+handY: DS 1
+
+otherPlayerMoveX: DS 1
+otherPlayerMoveY: DS 1
+
+serialBufferIn:  DS 1
+serialBufferOut: DS 1
+
+playerColor:   DS 1
+currentPlayer: DS 1
+
+blackScore: DS 1
+whiteScore: DS 1
+
+;--------------------------------
+
+SECTION "rom", ROM0
+
+INCLUDE "rst.inc"
+INCLUDE "interrupts.inc"
+
+; $0068 - $00FF: Free space
+DS $98
+
+INCLUDE "header.inc"
+
+; $0150
+main:
+    di
+
+    ; Initialize variables.
+
+    ld A, GAME_STATE_STARTING
+    ld [gameState], A
+
+    ld A, 0
+    ld [discsToFlipCoordIndex], A
+    ld [animationFrame], A
+
+    ld A, 5
+    ld [animationCountdown], A
+
+    ld A, 1
+    ld [isRightPressed], A
+    ld [isLeftPressed], A
+    ld [isUpPressed], A
+    ld [isDownPressed], A
+    ld [isAPressed], A
+    ld [isBPressed], A
+    ld [isSelectPressed], A
+    ld [isStartPressed], A
+
+    ld A, 4
+    ld [handX], A
+    ld [handY], A
+
+    ld A, 0
+    ld [otherPlayerMoveX], A
+    ld [otherPlayerMoveY], A
+
+    ld A, NO_DATA
+    ld [serialBufferIn], A
+    ld [serialBufferOut], A
+
+    ld A, COLOR_NONE
+    ld [playerColor], A
+
+    ld A, COLOR_BLACK
+    ld [currentPlayer], A
+
+    ld A, 2
+    ld [blackScore], A
+    ld [whiteScore], A
+
+    ; Turn off LCD.
+
+    ld HL, LCD_CONTROL
+    ld A, [HL]
+    and %01111111
+    ld [HL], A
+
+    ; Set palettes.
+
+    ld A, %11100100
+    ld [PALETTE_BG], A
+    ld A, %11100001
+    ld [PALETTE_OBJ_0], A
+
+    ; Clear background.
+
+    ld DE, 1024  ; Number of bytes to clear
+    ld B, 99
+    ld HL, BG_TILE_MAP
+    call memset
+
+    ; Copy bitmap graphics into VRAM.
+
+    ld DE, 2048  ; Number of bytes to copy
+    ld BC, graphics
+    ld HL, VIDEO_RAM
+    call memcpy
+
+    call drawBoard
+    call resetDiscs
+    call resetDiscsToFlipCoords
+    call drawAllDiscs
+    call drawScoreLabels
+    call drawScores
+
+    ld BC, textConnecting
+    call drawText
+
+    ; Clear sprite data (OAM).
+
+    ld DE, 160  ; Number of bytes to clear
+    ld B, 0
+    ld HL, OAM_DATA
+    call memset
+
+    call drawHand
+    call drawX
+
+    ; Turn on LCD.
+
+    ld HL, LCD_CONTROL
+    ld A, [HL]
+    or %10000010
+    ld [HL], A
+
+    ; Enable interrupts.
+
+    ld HL, INTERRUPT_ENABLE
+    ld A, [HL]
+    or %00001001
+    ld [HL], A
+
+    ei
+
+    ; Set up serial communications.
+
+    ld A, 0
+    ld [SERIAL_DATA], A
+    ld [SERIAL_CONTROL], A
+    ld A, %10000000
+    ld [SERIAL_CONTROL], A
+
+.mainLoop:
+    halt
+    jp .mainLoop
+
+;--------------------------------
+
+drawBoard:
+    ld HL, BG_TILE_MAP + 34
+    ld D, 8
+
+.drawRows
+    ld E, 8
+
+.drawSquareTops
+    ld [HL], 66
+    inc HL
+    ld [HL], 67
+    inc HL
+    dec E
+    jp nz, .drawSquareTops
+
+    ld [HL], 82
+    ld BC, 16
+    add HL, BC
+    ld E, 8
+
+.drawSquareBottoms
+    ld [HL], 82
+    inc HL
+    ld [HL], 99
+    inc HL
+    dec E
+    jp nz, .drawSquareBottoms
+
+    ld [HL], 82
+    ld BC, 16
+    add HL, BC
+    dec d
+    jp nz, .drawRows
+
+    ld E, 16
+
+.drawBottomBorder
+    ld [HL], 67
+    inc HL
+    dec E
+    jp nz, .drawBottomBorder
+
+    ld [HL], 80
+
+    ret
+
+;--------------------------------
+
+resetDiscs:
+    ld DE, 64
+    ld B, 0
+    ld HL, discs
+    call memset
+
+    ; Draw the four initial discs.
+
+    ld HL, discs + 27
+    ld [HL], COLOR_WHITE
+    inc HL
+    ld [HL], COLOR_BLACK
+
+    ld HL, discs + 35
+    ld [HL], COLOR_BLACK
+    inc HL
+    ld [HL], COLOR_WHITE
+
+    ret
+
+;--------------------------------
+
+resetDiscsToFlipCoords:
+    ld DE, 36
+    ld B, $FF
+    ld HL, discsToFlipCoords
+    call memset
+
+    ret
+
+;--------------------------------
+
+drawAllDiscs:
+    ld B, 7
+    ld C, 7
+
+.drawDisc:
+    call drawDisc
+    dec B
+    ld A, B
+    cp $FF
+    jp nz, .drawDisc
+
+    dec C
+    ld A, C
+    cp $FF
+    jp z, .done
+    ld B, 7
+    jp .drawDisc
+
+.done:
+    ret
+
+;--------------------------------
+
+drawDisc:
+    ; B = square X
+    ; C = square Y
+
+    ld A, C
+    sla A
+    sla A
+    sla A
+    add B
+
+    ld HL, discs
+    ld D, 0
+    ld E, A
+    add HL, DE
+    ld A, [HL]
+
+    ld H, 0
+    ld L, C
+    add HL, HL
+    add HL, HL
+    add HL, HL
+    add HL, HL
+    add HL, HL
+    add HL, HL
+    ld E, B
+    add HL, DE
+    add HL, DE
+    ld DE, BG_TILE_MAP + 34
+    add HL, DE
+
+    cp COLOR_BLACK
+    jp z, .pointToBlackTile
+    cp COLOR_WHITE
+    jp z, .pointToWhiteTile
+    jp .done
+
+.pointToWhiteTile
+    ld A, [animationFrame]
+    add A
+    add 36
+    jp .drawTiles
+
+.pointToBlackTile
+    ld A, [animationFrame]
+    add A
+    add 68
+
+.drawTiles
+    ld [HL], A
+    inc A
+    inc HL
+    ld [HL], A
+    ld D, 0
+    ld E, 31
+    add HL, DE
+    add 15
+    ld [HL], A
+    inc A
+    inc HL
+    ld [HL], A
+
+.done
+    ret
+
+;--------------------------------
+
+drawText:
+    ; BC = text address
+
+    ld HL, BG_TILE_MAP + 5
+    ld D, 10
+
+.copyByte:
+    ld A, [BC]
+    cp " "
+    jp z, .space
+    cp "!"
+    jp z, .exclamation
+
+    ; Capital letter ASCII
+    sub 65
+    jp .drawCharacter
+    
+.space
+    ld A, 99
+    jp .drawCharacter
+
+.exclamation
+    ld A, 49
+
+.drawCharacter
+    ld [HL], A
+    inc BC
+    inc HL
+    dec D
+    jr nz, .copyByte
+
+    ret
+
+;--------------------------------
+
+drawScoreLabels:
+    ld HL, BG_TILE_MAP
+    ld [HL], 50
+    inc HL
+    ld [HL], 81
+
+    ld HL, BG_TILE_MAP + 16
+    ld [HL], 51
+    inc HL
+    ld [HL], 81
+
+    ret
+
+;--------------------------------
+
+drawScores:
+    ld B, COLOR_BLACK
+    call drawScore
+    ld B, COLOR_WHITE
+    call drawScore
+
+    ret
+
+;--------------------------------
+
+drawScore:
+    ; B = tile color
+
+    ld A, B
+    cp COLOR_BLACK
+    jp z, .black
+
+    ; White
+    
+    ld A, [whiteScore]
+    jp .calculateDigits
+
+.black
+    ld A, [blackScore]
+
+.calculateDigits
+    ld D, 26
+    ld E, 26
+
+.subtract10
+    cp 10
+    jp c, .subtract1
+    inc D
+    sub 10
+    jp .subtract10
+
+.subtract1
+    cp 0
+    jp z, .positionNumbers
+    inc E
+    dec A
+    jp .subtract1
+
+.positionNumbers
+    ld A, B
+    cp COLOR_BLACK
+    jp z, .positionBlack
+    ld HL, BG_TILE_MAP + 18
+    jp .printNumbers
+
+.positionBlack
+    ld HL, BG_TILE_MAP + 2
+
+.printNumbers
+    ld [HL], D
+    inc HL
+    ld [HL], E
+
+    ret
+
+;--------------------------------
+
+drawCurrentPlayerIndicator:
+    ld A, [currentPlayer]
+    cp COLOR_WHITE
+    jp z, .white
+
+    ; Black
+
+    ld HL, BG_TILE_MAP + 4
+    ld [HL], 64
+    ld HL, BG_TILE_MAP + 15
+    ld [HL], 99
+    jp .done
+
+.white
+    ld HL, BG_TILE_MAP + 4
+    ld [HL], 99
+    ld HL, BG_TILE_MAP + 15
+    ld [HL], 65
+
+.done
+    ret
+
+;--------------------------------
+
+drawHand:
+    ld HL, OAM_DATA
+    ld [HL], 96
+    inc HL
+    ld [HL], 93
+    inc HL
+    ld [HL], 96
+    inc HL
+
+    inc HL
+    ld [HL], 96
+    inc HL
+    ld [HL], 101
+    inc HL
+    ld [HL], 97
+    inc HL
+
+    inc HL
+    ld [HL], 104
+    inc HL
+    ld [HL], 93
+    inc HL
+    ld [HL], 112
+    inc HL
+
+    inc HL
+    ld [HL], 104
+    inc HL
+    ld [HL], 101
+    inc HL
+    ld [HL], 113
+
+    ret
+
+;--------------------------------
+
+drawX:
+    ld HL, OAM_DATA + 16
+    ld [HL], 89
+    inc HL
+    ld [HL], 89
+    inc HL
+    ld [HL], 99
+    inc HL
+
+    inc HL
+    ld [HL], 89
+    inc HL
+    ld [HL], 96
+    inc HL
+    ld [HL], 99
+    inc HL
+    ld [HL], %00100000
+
+    inc HL
+    ld [HL], 96
+    inc HL
+    ld [HL], 89
+    inc HL
+    ld [HL], 99
+    inc HL
+    ld [HL], %01000000
+
+    inc HL
+    ld [HL], 96
+    inc HL
+    ld [HL], 96
+    inc HL
+    ld [HL], 99
+    inc HL
+    ld [HL], %01100000
+
+    ret
+
+;--------------------------------
+
+showX:
+    ld HL, OAM_DATA + 18
+    ld [HL], 98
+    ld HL, OAM_DATA + 22
+    ld [HL], 98
+    ld HL, OAM_DATA + 26
+    ld [HL], 98
+    ld HL, OAM_DATA + 30
+    ld [HL], 98
+
+    ret
+
+;--------------------------------
+
+hideX:
+    ld HL, OAM_DATA + 18
+    ld [HL], 99
+    ld HL, OAM_DATA + 22
+    ld [HL], 99
+    ld HL, OAM_DATA + 26
+    ld [HL], 99
+    ld HL, OAM_DATA + 30
+    ld [HL], 99
+
+    ret
+
+;--------------------------------
+
+flipDiscs:
+    ld HL, animationCountdown
+    dec [HL]
+    jp nz, .done
+
+    ; Get (x, y) coordinates.
+
+    ld A, [discsToFlipCoordIndex]
+    ld HL, discsToFlipCoords
+    ld D, 0
+    ld E, A
+    add HL, DE
+    ld B, [HL]
+    inc HL
+    ld C, [HL]
+
+    ; Update animation.
+
+    ld A, 5
+    ld [animationCountdown], A
+
+    ld HL, animationFrame
+    inc [HL]
+    ld A, [HL]
+    cp 6
+    jp nz, .drawDisc
+
+    ; Reset animation.
+
+    ld A, 0
+    ld [animationFrame], A
+
+    ; Get disc value.
+
+    ld A, C
+    sla A
+    sla A
+    sla A
+    add B
+
+    ld HL, discs
+    ld E, A
+    add HL, DE
+    ld A, [HL]
+
+    ; Toggle disc value.
+
+    cp COLOR_BLACK
+    jp z, .flipToWhite
+    cp COLOR_WHITE
+    jp z, .flipToBlack
+    jp .nextDisc
+
+.flipToWhite
+    ld [HL], COLOR_WHITE
+    ld HL, whiteScore
+    inc [HL]
+    ld HL, blackScore
+    dec [HL]
+    
+    jp .nextDisc
+
+.flipToBlack
+    ld [HL], COLOR_BLACK
+    ld HL, blackScore
+    inc [HL]
+    ld HL, whiteScore
+    dec [HL]
+
+.nextDisc
+    ld A, [discsToFlipCoordIndex]
+    ld HL, discsToFlipCoords
+    ld E, A
+    add HL, DE
+    ld [HL], 0
+    inc HL
+    ld [HL], 0
+    inc A
+    inc A
+    ld [discsToFlipCoordIndex], A
+    inc HL
+    ld A, [HL]
+    cp $FF
+    jp nz, .drawDisc
+
+    ; Animation is done.
+
+    ld A, 0
+    ld [discsToFlipCoordIndex], A
+
+    ld A, [playerColor]
+    ld D, A
+    ld A, [currentPlayer]
+    cp D
+    jp z, .otherPlayerTurn
+
+    ld A, GAME_STATE_DRAW_GAME_INFO
+    ld [gameState], A
+    jp .changePlayer
+
+.otherPlayerTurn
+    ld A, WAITING_FOR_OTHER_PLAYER_TURN
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_OTHER_PLAYER_TURN
+    ld [gameState], A
+
+.changePlayer
+    ld A, [currentPlayer]
+    cp COLOR_BLACK
+    jp z, .setCurrentPlayerWhite
+    cp COLOR_WHITE
+    jp z, .setCurrentPlayerBlack
+    jp .drawDisc
+
+.setCurrentPlayerWhite
+    ld HL, blackScore
+    inc [HL]
+    ld A, COLOR_WHITE
+    ld [currentPlayer], A
+    jp .drawDisc
+
+.setCurrentPlayerBlack
+    ld HL, whiteScore
+    inc [HL]
+    ld A, COLOR_BLACK
+    ld [currentPlayer], A
+
+.drawDisc
+    call drawDisc
+
+.done
+    ret
+
+;--------------------------------
+
+playerTurn:
+    call getInput
+
+    ; Check up.
+
+    ld A, [handY]
+    cp 0
+    jp z, .checkDown
+    ld A, [isUpPressed]
+    cp BUTTON_JUST_PRESSED
+    jp nz, .checkDown
+
+    ld HL, OAM_DATA - 4
+    ld B, 4
+
+.moveHandPartUp
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    sub 16
+    ld [HL], A
+    dec B
+    jp nz, .moveHandPartUp
+
+    ld HL, OAM_DATA + 12
+    ld B, 4
+
+.moveXPartUp
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    sub 16
+    ld [HL], A
+    dec B
+    jp nz, .moveXPartUp
+
+    ld HL, handY
+    dec [HL]
+
+.checkDown
+    ld A, [handY]
+    cp 7
+    jp z, .checkLeft
+    ld A, [isDownPressed]
+    cp BUTTON_JUST_PRESSED
+    jp nz, .checkLeft
+
+    ld HL, OAM_DATA - 4
+    ld B, 4
+
+.moveHandPartDown
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    add 16
+    ld [HL], A
+    dec B
+    jp nz, .moveHandPartDown
+
+    ld HL, OAM_DATA + 12
+    ld B, 4
+
+.moveXPartDown
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    add 16
+    ld [HL], A
+    dec B
+    jp nz, .moveXPartDown
+
+    ld HL, handY
+    inc [HL]
+
+.checkLeft
+    ld A, [handX]
+    cp 0
+    jp z, .checkRight
+    ld A, [isLeftPressed]
+    cp BUTTON_JUST_PRESSED
+    jp nz, .checkRight
+
+    ld HL, OAM_DATA - 3
+    ld B, 4
+
+.moveHandPartLeft
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    sub 16
+    ld [HL], A
+    dec B
+    jp nz, .moveHandPartLeft
+
+    ld HL, OAM_DATA + 13
+    ld B, 4
+
+.moveXPartLeft
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    sub 16
+    ld [HL], A
+    dec B
+    jp nz, .moveXPartLeft
+
+    ld HL, handX
+    dec [HL]
+
+.checkRight
+    ld A, [handX]
+    cp 7
+    jp z, .checkA
+    ld A, [isRightPressed]
+    cp BUTTON_JUST_PRESSED
+    jp nz, .checkA
+
+    ld HL, OAM_DATA - 3
+    ld B, 4
+
+.moveHandPartRight
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    add 16
+    ld [HL], A
+    dec B
+    jp nz, .moveHandPartRight
+
+    ld HL, OAM_DATA + 13
+    ld B, 4
+
+.moveXPartRight
+    inc HL
+    inc HL
+    inc HL
+    inc HL
+    ld A, [HL]
+    add 16
+    ld [HL], A
+    dec B
+    jp nz, .moveXPartRight
+
+    ld HL, handX
+    inc [HL]
+
+.checkA
+    ld A, [isAPressed]
+    cp BUTTON_JUST_PRESSED
+    jp nz, .done
+
+    ld A, [handY]
+    sla A
+    sla A
+    sla A
+    ld B, A
+    ld A, [handX]
+    add B
+    add $08
+    ld [serialBufferOut], A
+
+    ld A, GAME_STATE_TRYING_PLACE_DISC
+    ld [gameState], A
+
+.done
+    ret
+
+;--------------------------------
+
+drawGameInfo:
+    call drawScores
+    call drawCurrentPlayerIndicator
+    ld BC, textYourTurn
+    call drawText
+
+    ld A, GAME_STATE_PLAYER_TURN
+    ld [gameState], A
+
+    ret
+
+;--------------------------------
+
+otherPlayerTurn:
+    call drawScores
+    call drawCurrentPlayerIndicator
+    ld BC, textOtherPlayerTurn
+    call drawText
+
+    ret
+
+;--------------------------------
+
+getInput:
+
+    ld A, $20  ; Read D, U, L, R keys
+    ld [JOYPAD], A
+    ld A, [JOYPAD]
+    ld A, [JOYPAD]
+
+    ld B, A
+    and 1
+    ld HL, isRightPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isLeftPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isUpPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isDownPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    ; Read buttons.
+
+    ld A, $10  ; Reads keys A, B, Select, Start
+    ld [JOYPAD], A
+
+    REPT 6
+        ld A, [JOYPAD]
+    ENDR
+
+    ld B, A
+    and 1
+    ld HL, isAPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isBPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isSelectPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    sra B
+    ld A, B
+    and 1
+    ld HL, isStartPressed
+    sla [HL]
+    or [HL]
+    and %00000011
+    ld [HL], A
+
+    ld A, $30  ; Port reset
+    ld [JOYPAD], A
+
+    ret
+
+;--------------------------------
+
+start:
+    ld A, GAME_BOY_JOINING
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_JOINING
+    ld [gameState], A
+
+    ret
+
+;--------------------------------
+
+waitForPlayer2:
+    ld BC, textWaitingForOtherPlayer
+    call drawText
+
+    ret
+
+;--------------------------------
+
+moveIsValid:
+    ld A, [handY]
+    sla A
+    sla A
+    sla A
+    ld B, A
+    ld A, [handX]
+    add B
+
+    ld HL, discs
+    ld B, 0
+    ld C, A
+    add HL, BC
+    ld A, [currentPlayer]
+    ld [HL], A
+    
+    ld A, [handX]
+    ld B, A
+    ld A, [handY]
+    ld C, A
+    call drawDisc
+
+    ret
+
+;--------------------------------
+
+moveIsNotValid:
+    ld HL, animationCountdown
+    dec [HL]
+    jp z, .hideX
+
+    call showX
+    ld BC, textInvalidMove
+    call drawText
+    jp .done
+
+.hideX
+    call hideX
+    ld A, GAME_STATE_PLAYER_TURN
+    ld [gameState], A
+    ld BC, textYourTurn
+    call drawText
+
+.done
+    ret
+
+;--------------------------------
+
+getOtherPlayerDiscsToFlip:
+    ld A, [otherPlayerMoveY]
+    sla A
+    sla A
+    sla A
+    ld B, A
+    ld A, [otherPlayerMoveX]
+    add B
+
+    ld HL, discs
+    ld B, 0
+    ld C, A
+    add HL, BC
+    ld A, [currentPlayer]
+    ld [HL], A
+    
+    ld A, [otherPlayerMoveX]
+    ld B, A
+    ld A, [otherPlayerMoveY]
+    ld C, A
+    call drawDisc
+
+    ret
+
+;--------------------------------
+
+INCLUDE "memory.inc"
+
+graphics:
+INCBIN "graphics.bin"
+
+;--------------------------------
+
+textConnecting:
+    DB "CONNECTING"
+textWaitingForOtherPlayer:
+    DB " WAITING  "
+textYourTurn:
+    DB "YOUR TURN "
+textOtherPlayerTurn:
+    DB "WAIT TURN "
+textInvalidMove:
+    DB " INVALID  "
+textNoMoves:
+    DB " NO MOVES "
+textWon:
+    DB " YOU WON! "
+textLost:
+    DB " YOU LOST "
+textGameEnded:
+    DB "GAME ENDED"
+
+;--------------------------------
+
+draw:
+    ld A, [gameState]
+    cp GAME_STATE_STARTING
+    jp z, .start
+    cp GAME_STATE_WAITING_FOR_PLAYER_2
+    jp z, .waitForPlayer2
+    cp GAME_STATE_PLAYER_TURN
+    jp z, .playerTurn
+    cp GAME_STATE_DRAW_GAME_INFO
+    jp z, .drawGameInfo
+    cp GAME_STATE_OTHER_PLAYER_TURN
+    jp z, .otherPlayerTurn
+    cp GAME_STATE_MOVE_IS_VALID
+    jp z, .moveIsValid
+    cp GAME_STATE_MOVE_IS_NOT_VALID
+    jp z, .moveIsNotValid
+    cp GAME_STATE_GETTING_OTHER_DISCS
+    jp z, .getOtherPlayerDiscsToFlip
+    cp GAME_STATE_FLIPPING_DISCS
+    jp z, .flipDiscs
+    jp .done
+ 
+.start
+    call start
+    jp .done
+
+.waitForPlayer2
+    call waitForPlayer2
+    jp .done
+
+.playerTurn
+    call playerTurn
+    jp .done
+
+.drawGameInfo
+    call drawGameInfo
+    jp .done
+
+.otherPlayerTurn
+    call otherPlayerTurn
+    jp .done
+
+.moveIsValid
+    call moveIsValid
+    jp .done
+
+.moveIsNotValid
+    call moveIsNotValid
+    jp .done
+
+.getOtherPlayerDiscsToFlip
+    call getOtherPlayerDiscsToFlip
+    jp .done
+
+.flipDiscs
+    call flipDiscs
+    jp .done
+
+.done:
+    reti
+
+;--------------------------------
+
+stat:
+    reti
+
+;--------------------------------
+
+timer:
+    reti
+
+;--------------------------------
+
+serial:
+    ld A, [SERIAL_DATA]
+    ld [serialBufferIn], A
+    ld A, [serialBufferOut]
+    ld [SERIAL_DATA], A
+    ld A, NO_DATA
+    ld [serialBufferOut], A
+    ld A, %10000000
+    ld [SERIAL_CONTROL], A
+
+    ld A, [serialBufferIn]
+    cp COLOR_SET_BLACK
+    jp z, .colorSetBlack
+    cp PLAYER_2_JOINED
+    jp z, .player2Joined
+    cp PLAYER_2_NOT_JOINED
+    jp z, .player2NotJoined
+    cp COLOR_SET_WHITE
+    jp z, .colorSetWhite
+    cp MOVE_IS_VALID
+    jp z, .moveIsValid
+    cp MOVE_IS_NOT_VALID
+    jp z, .moveIsNotValid
+    cp NO_MORE_DISCS_TO_FLIP
+    jp z, .noMoreDiscsToFlip
+    cp OTHER_PLAYER_IS_DONE
+    jp z, .otherPlayerIsDone
+    cp OTHER_PLAYER_IS_NOT_DONE
+    jp z, .otherPlayerIsNotDone
+    
+    ; Is value between $08 and $48 inclusive?
+
+    cp $08
+    jp c, .clearDataIn
+    cp $49
+    jp nc, .clearDataIn
+
+    ; Calculate X coord from index.
+
+    sub $08
+    ld B, A
+    sra B
+    sra B
+    sra B
+    sla B
+    sla B
+    sla B
+    sub B
+    ld B, A
+
+    ; Calculate Y coord.
+
+    ld A, [serialBufferIn]
+    sub $08
+    sub B
+    sra A
+    sra A
+    sra A
+    ld C, A
+
+    ld A, [gameState]
+    cp GAME_STATE_OTHER_PLAYER_IS_DONE
+    jp nz, .updateDiscsToFlip
+
+    ld A, B
+    ld [otherPlayerMoveX], A
+    ld A, C
+    ld [otherPlayerMoveY], A
+    ld A, GAME_STATE_GETTING_OTHER_DISCS
+    ld [gameState], A
+    jp .getNextDiscToFlip
+
+.updateDiscsToFlip
+    ; Save coordinates and update index.
+
+    ld A, [discsToFlipCoordIndex]
+    ld HL, discsToFlipCoords
+    ld D, 0
+    ld E, A
+    add HL, DE
+    ld [HL], B
+    inc HL
+    ld [HL], C
+    inc A
+    inc A
+    ld [discsToFlipCoordIndex], A
+
+.getNextDiscToFlip
+    ld A, GET_NEXT_DISC_TO_FLIP
+    ld [serialBufferOut], A
+    jp .clearDataIn
+
+.colorSetBlack
+    ld A, COLOR_BLACK
+    ld [playerColor], A
+    ld A, GAME_BOY_WAITING_FOR_PLAYER_2
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_WAITING_FOR_PLAYER_2
+    ld [gameState], A
+    jp .clearDataIn
+
+.player2Joined
+    ld A, GAME_STATE_DRAW_GAME_INFO
+    ld [gameState], A
+    jp .clearDataIn
+
+.player2NotJoined
+    ld A, GAME_BOY_WAITING_FOR_PLAYER_2
+    ld [serialBufferOut], A
+    jp .clearDataIn
+
+.colorSetWhite
+    ld A, COLOR_WHITE
+    ld [playerColor], A
+    ld A, WAITING_FOR_OTHER_PLAYER_TURN
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_OTHER_PLAYER_TURN
+    ld [gameState], A
+    jp .clearDataIn
+
+.moveIsValid
+    ld A, GET_NEXT_DISC_TO_FLIP
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_MOVE_IS_VALID
+    ld [gameState], A
+
+    call resetDiscsToFlipCoords
+
+    jp .clearDataIn
+
+.moveIsNotValid
+    ld A, GAME_STATE_MOVE_IS_NOT_VALID
+    ld [gameState], A
+    ld A, 120
+    ld [animationCountdown], A 
+    jp .clearDataIn
+
+.noMoreDiscsToFlip
+    ld A, GAME_STATE_FLIPPING_DISCS
+    ld [gameState], A
+    ld A, 5
+    ld [animationCountdown], A
+    ld A, 0
+    ld [discsToFlipCoordIndex], A
+    jp .clearDataIn
+
+.otherPlayerIsDone
+    ld A, GET_OTHER_PLAYER_MOVE
+    ld [serialBufferOut], A
+    ld A, GAME_STATE_OTHER_PLAYER_IS_DONE
+    ld [gameState], A
+
+    call resetDiscsToFlipCoords
+
+    jp .clearDataIn
+
+.otherPlayerIsNotDone
+    ld A, WAITING_FOR_OTHER_PLAYER_TURN
+    ld [serialBufferOut], A
+    jp .clearDataIn
+
+.clearDataIn
+    ld A, NO_DATA
+    ld [serialBufferIn], A
+
+    reti
+
+;--------------------------------
+
+joypad:
+    reti
