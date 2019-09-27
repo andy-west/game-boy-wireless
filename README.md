@@ -7,4 +7,4 @@ This is the companion code for *element14 Presents* episode 383: "Gameboy Wirele
 [![Automated Robot Artist](https://img.youtube.com/vi/n2ue82tx4DM/0.jpg)](https://www.youtube.com/watch?v=n2ue82tx4DM)
  
 element14 Community page:
-https://www.element14.com/community/docs/DOC-9149
+https://www.element14.com/community/docs/DOC-91498
